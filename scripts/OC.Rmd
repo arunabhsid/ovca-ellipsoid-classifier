@@ -1,0 +1,727 @@
+---
+title: "Ovarian Cancer Project"
+author: "Michael Kalab, Arunabh Sharma"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Libraries:
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(openxlsx)
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(forcats)
+library(reticulate)
+library(ggforce)
+library(matlib)
+library(gridExtra)
+library(zplyr)
+library(GGally)
+library(ggpubr)
+library(cowplot)
+```
+
+## Data preparation
+
+Python functions:
+
+```{r python_functions, message=FALSE, warning=FALSE}
+use_python("/usr/bin/python3")
+source_python("OC_ellipsoid.py")
+source_python("OC_linear_prog.py")
+# use matrix command from R, not from python
+matrix <- base::matrix 
+```
+
+Load raw data:
+
+```{r}
+dta <- read.xlsx("../raw_data/Datentabelle Korrektur 3.xlsx", sheet = "Daten1 OvCa",
+                 skipEmptyRows = TRUE)
+train <- read.xlsx("../raw_data/Datentabelle Korrektur 3.xlsx", sheet = "Daten2 w o Tumor train",
+                   skipEmptyRows = TRUE)
+dta$NumObs <- rowSums(!is.na(dta %>% select(contains("FAM.conc") | contains("HEX.conc"))))
+```
+
+Data wrangling for the values of FAM and HEX:
+
+```{r}
+train %>% select(contains("FAM.conc") | contains("HEX.conc")) %>% +1 %>% log() %>% min(., na.rm = T)
+cor(train %>% select(contains("FAM.conc") | contains("HEX.conc")) %>% +1 %>% log(), use = "pair")
+
+dta$ID <- ifelse(grepl("ovca", dta$ID), dta$ID, paste0("ovca", dta$ID)) # create useful IDs
+dta$group <- "ovca"
+dta <- dta %>% rename_with(~gsub("t1\\.", "", .x), everything())
+train$ID <- ifelse(grepl("train", train$ID), train$ID, paste0("train", train$ID))
+train$group <- "train"
+
+
+train$OP <- "healthy"
+dta$OP <- ifelse(dta$OP=="1", "resection", ifelse(dta$OP=="2", "unresectable", dta$OP))
+total <- full_join(train, dta, by = intersect(names(train), names(dta)))
+total$OP <- fct_relevel(total$OP, "resection", "unresectable", "healthy", "no OP")
+```
+
+
+Here, the interesting variables (FAM, HEX) are prepared and renamed (also for graphics later)
+
+```{r}
+total <- total %>% select(ID, group, OP, contains("FAM.conc") & starts_with("A"),
+                          contains("HEX.conc") & starts_with("A"),
+                          contains("Quot.conc") & starts_with("A")) %>%
+  rename(
+    FAM1_TIMM21 = A1.FAM.conc,
+    FAM2_MYOCD = A2.FAM.conc,
+    FAM3_CHR22 = A3.FAM.conc,
+    FAM4_TIMM21 = A4.FAM.conc,
+    FAM5_PAK2 = A5.FAM.conc,
+    FAM6_PVT1 = A6.FAM.conc,
+    HEX1_JAK = A1.HEX.conc,
+    HEX2_JAK = A2.HEX.conc,
+    HEX3_JAK = A3.HEX.conc,
+    HEX4_USP7 = A4.HEX.conc,
+    HEX5_JAK = A5.HEX.conc,
+    HEX6_JAK = A6.HEX.conc,
+  )
+```
+
+Pattern of missingness:
+
+```{r}
+# Pattern of missingness
+colSums(is.na(total[, 1:15]))
+rowSums(is.na(total[, 1:15]))
+```
+
+Write to file:
+
+```{r}
+write.table(total, "../final_datasets/Data_Klopf_raw_and_sums.csv", sep = ";", dec = ".")
+```
+
+## Ellipsoid algorithm implementation
+
+Our key idea was to enclose case samples within a convex set while keeping control samples outside. For a second-order polynomial kernel, this corresponds to requiring that the coefficient matrix of the quadratic terms be positive semidefinite.Accordingly, in this study, we formulated and solved a semidefinite program (SDP) to obtain the separating surface.
+
+Because false negatives are more critical than false positives, we introduce a hyperparameter $\mu$, with $0 < \mu < 1$, to allow adjustment toward either high sensitivity ($\mu$ close to 1) or high specificity ($\mu$ closer to 0) in cases where perfect separation is not possible. 
+
+We represent cases and controls as vectors in $\mathbb{R}^n$, denoting the set of cases by $S$ and the set of controls by $H$, and let $\varepsilon > 0$ (its exact value is not crucial). The SDP is formulated as:
+
+**(SDP):** $$
+\min \, \mu \sum_{s \in S} z_s + (1 - \mu) \sum_{h \in H} z_h
+$$
+
+Subject to  
+$$
+s^T X s + s^T x + x_0 - z_s \leq -\varepsilon \quad \forall s \in S \tag{R1}
+$$
+$$
+h^T X h + h^T x + x_0 + z_h \geq \varepsilon \quad \forall h \in H \tag{R2}
+$$
+$$
+z \geq 0
+$$
+$$
+X \in \mathbb{R}^{n \times n} \text{ positive semidefinite}, \quad x \in \mathbb{R}^n, \quad x_0 \in \mathbb{R}, \quad z \in \mathbb{R}^{|S| + |H|}
+$$
+
+Since (SDP) is a convex optimization problem, any solution is guaranteed to be a global minimum. Let $(X_{\text{opt}}, x_{\text{opt}}, x_{0,\text{opt}})$ be a minimizer of (SDP). In practice, $X_{\text{opt}}$ is strictly positive definite. The equation
+
+$$
+s^T X_{\text{opt}} s + s^T x_{\text{opt}} + x_{0,\text{opt}} = 0
+$$
+
+defines an ellipsoid, and can be rewritten as:
+
+$$
+(s - s_0)^T A (s - s_0) = 1,
+$$
+
+where
+
+$$
+s_0 = -\tfrac{1}{2} X_{\text{opt}}^{-1} x_{\text{opt}}, \quad
+A = \frac{X_{\text{opt}}}{s_0^T X_{\text{opt}} s_0 - x_{0,\text{opt}}}.
+$$
+
+**Log transformation:**
+
+```{r}
+# Read prepared data
+dta = read.table("../final_datasets/Data_Klopf_raw_and_sums.csv", sep = ";")
+
+dta$label <- ifelse(dta$group == "ovca", gsub("ovca", "", dta$ID), "")
+```
+
+```{r}
+scalesum <- function(x){
+  return (log(1+x, base = exp(1))) # this NEEDS to be done, otherwise the algorithm is not stable in higher dimensions
+}
+
+# Apply log-transform to FAM and HEX values only. Then calculate sum and ratio
+
+dta <- dta %>%
+  mutate(across(starts_with("FAM") | starts_with("HEX"), scalesum)) %>%
+  mutate(
+    sum1_TIMM21_JAK = FAM1_TIMM21 + HEX1_JAK,
+    sum2_MYOCD_JAK = FAM2_MYOCD + HEX2_JAK,
+    sum3_CHR22_JAK = FAM3_CHR22 + HEX3_JAK,
+    sum4_TIMM21_USP7 = FAM4_TIMM21 + HEX4_USP7,
+    sum5_PAK2_JAK = FAM5_PAK2 + HEX5_JAK,
+    sum6_PVT1_JAK = FAM6_PVT1 + HEX6_JAK,
+    
+    quot1_TIMM21_JAK = FAM1_TIMM21 / HEX1_JAK,
+    quot2_MYOCD_JAK  = FAM2_MYOCD / HEX2_JAK,
+    quot3_CHR22_JAK  = FAM3_CHR22 / HEX3_JAK,
+    quot4_TIMM21_USP7 = FAM4_TIMM21 / HEX4_USP7,
+    quot5_PAK2_JAK   = FAM5_PAK2 / HEX5_JAK,
+    quot6_PVT1_JAK   = FAM6_PVT1 / HEX6_JAK
+  )
+
+# Save (for paper)
+write.csv(dta, "../results/sums_and_ratios_OC_controls.csv", row.names = FALSE)
+
+```
+
+Mean imputation for missing data (separately for patients and controls)
+
+- group: train (healthy), ovca (ovarian cancer patients)
+
+```{r}
+# imputation by mean for missing data
+#total <- total %>% mutate_if(is.numeric, ~ifelse(is.na(.x), mean(.x, na.rm = TRUE), .x))
+
+dta <- dta %>%
+  group_by(group) %>%
+  mutate(across(where(is.numeric), ~ ifelse(is.na(.), mean(., na.rm = TRUE), .))) %>%
+  ungroup()
+```
+
+
+
+### Plots of correlation of the ratios and sums (FAM, HEX) --> Figure for paper
+
+```{r, message=FALSE, warning=FALSE}
+pl <- ggpairs(dta %>%
+              mutate(group = as.factor(ifelse(group == "ovca", "Patients", "Healthy")),
+                     group = relevel(group, "Patients"),
+                     quot1_TIMM21_JAK = - quot1_TIMM21_JAK,
+                     quot4_TIMM21_USP7 = - quot4_TIMM21_USP7) %>% 
+              select(group, starts_with("quot")),
+            aes(colour = group),
+            columns = names(dta %>% select(starts_with("quot"))),
+            columnLabels = c("TIMM21/JAK", "MYOCD/JAK",
+                             "CHR22/JAK", "TIMM21/USP7", "PAK/JAK", "PVT1/JAK"),
+            upper = list(continuous = wrap("cor", size = 3, method= "spearman")),
+            diag = list(continuous = "densityDiag"),
+            lower = list(continuous = wrap("points", size = 0.5))) + 
+  ggtitle("Spearman correlations between variables by group") + theme_minimal() 
+
+# Thanks to: https://stackoverflow.com/questions/34740210/how-to-change-the-color-palette-for-ggallyggpairs
+for(i in 1:pl$nrow) {
+  for(j in 1:pl$ncol){
+    pl[i,j] <- pl[i,j] + 
+      scale_fill_manual(values=c("firebrick4", "green4")) +
+      scale_color_manual(values=c("firebrick4", "green4"))  
+  }
+}
+
+#ggsave("../plots/TotalT1/Correlations.pdf", plot = pl, height = 12, width = 12)
+
+jpeg("../plots/final/Correlation.jpg",height=8,width=8,units='in',res=600)
+pl
+dev.off()
+```
+
+```{r fig.width=10, fig.height=7, out.width='100%', echo=FALSE}
+knitr::include_graphics("../plots/final/Correlation.jpg")
+```
+
+
+\newpage
+
+### Plots of datasets and ellipses/ellipsoids
+
+```{r}
+# Create the ellipse for drawing the graph
+create_ellipse <- function(A_inv_sqrt, x0, n = 1000, theta = NULL, guess = NULL, thresh = NULL){
+  if (is.null(theta)){
+    theta <- seq(0, 2*pi, length.out = n)
+  }
+  ell <- cbind(cos(theta), sin(theta))
+  ell <- (ell %*% A_inv_sqrt) + cbind(rep(x0[1], n), rep(x0[2], n))
+  ell <- data.frame(ell)
+  if (!is.null(guess)){
+    ell$check <- (ell$X1 - guess[1])^2 + (ell$X2 - guess[2])^2
+    theta <- theta[order(ell$check)]
+    theta <- c(theta[1], theta[2]) # the points that are closest to range of the points
+    theta <- seq(min(theta), max(theta), length.out = n)
+    ell <- cbind(cos(theta), sin(theta))
+    ell <- (ell %*% A_inv_sqrt) + cbind(rep(x0[1], n), rep(x0[2], n))
+    ell <- data.frame(ell)
+    print(ell)
+  }
+  return (ell)
+}
+
+# Function for creating plots for each combination of log(FAM)/log(HEX) and log(FAM)+log(HEX)
+
+createplots <- function(catnames, data = NULL, nopos = FALSE, mu = 0.5,
+                        guess = NULL, thresh = NULL){
+  if (is.null(data)){
+    dta = dta
+  }
+  else {
+    dta = data
+  }
+  sol <- solve_ellipse(dta %>% select(ID, group, catnames), nopos = nopos, mu = mu)
+  
+  tab <- table(dta$group, (as.matrix(sol$data) %*% as.matrix(sol$solution)) > 0)
+  
+  if (dim(tab)[2] < 2){
+    sens <- 1
+    spec <- 1
+  }
+  else{
+    tab <- cbind(tab[1,1], tab[2,2])/rowSums(tab)
+    sens <- round(tab[1], 3)
+    spec <- round(tab[2], 3)
+  }
+
+  categories <- c()
+  titlecats <- c()
+  catset <- c()
+  
+  # for (catname in catnames){
+  #   if (grepl("sum", catname)){
+  #     categories <- c(categories, paste0("log(", gsub("_", "+", gsub("sum[1-6]+_",
+  #                                                                    "", catname)), ")"))
+  #     titlecats <- c(titlecats, gsub("_", "-", gsub("sum[1-6]+_", "", catname)))
+  #   }
+  #   else {
+  #     categories <- c(categories, gsub("_", "/", gsub("quot[1-6]+_", "", catname)))
+  #     catset <- c(catset, sub("\\D*(\\d+).*", "\\1", catname))
+  #   }
+  # }
+  
+  for (catname in catnames) {
+  if (grepl("sum", catname)) {
+    # Convert "sum1_FAM_HEX" → "log(FAM)+log(HEX)"
+    raw <- gsub("sum[1-6]+_", "", catname)
+    categories <- c(categories,
+                    paste0("log(", gsub("_", ")+log(", raw), ")"))  # no extra paste0 wrapping!
+    titlecats <- c(titlecats, gsub("_", "-", raw))
+  }
+  else if (grepl("quot", catname)) {
+    # Convert "quot1_FAM_HEX" → "log(FAM)/log(HEX)"
+    raw <- gsub("quot[1-6]+_", "", catname)
+    parts <- unlist(strsplit(raw, "_"))
+    categories <- c(categories, paste0("log(", parts[1], ")/log(", parts[2], ")"))
+    catset <- c(catset, sub("\\D*(\\d+).*", "\\1", catname))
+  }
+}
+
+  title_gen = paste0("Boundary for assay ", paste(titlecats, collapse = ", "),
+                 "\nSensitivity: ", sens, "\nSpecificity: ", spec
+                 )
+  # this loop also works for generating graphics with MORE than 2 dimensions,
+  # but ellipsoids are outside of scope (and terribly high-dimensional)
+  for (name1 in catnames){
+    skip = TRUE
+    for (name2 in catnames){
+      if (name1 == name2){
+        skip = FALSE
+        next
+      }
+      if (skip){
+        next
+      }
+      index1 = which(catnames == name1)
+      index2 = which(catnames == name2)
+      ell <- create_ellipse(sqrt_project(sol$A, index1, index2), sol$x0[c(index1, index2)],
+                            n = 100000,
+                            guess = guess, thresh = thresh)
+      dtaplot <- dta
+      dtaplot$classified <- as.factor(ifelse((as.matrix(sol$data) %*% as.matrix(sol$solution) >0),
+                                             "healthy", "sick"))
+      dtaplot$group <- as.factor(ifelse(dtaplot$group == "ovca", "sick", "healthy"))
+      dtaplot$classified <- relevel(dtaplot$classified, "sick")
+      dtaplot$group <- relevel(dtaplot$group, "sick")
+      # NEW: Recode values for clearer legend labels
+      dtaplot$group <- recode_factor(dtaplot$group,
+                               "sick" = "OC", 
+                               "healthy" = "Healthy")
+      dtaplot$classified <- recode_factor(dtaplot$classified,
+                                    "sick" = "OC", 
+                                    "healthy" = "Healthy")
+      x_lab <- categories[index1]
+      y_lab <- categories[index2]
+      
+      if (length(catnames) > 2){
+        add_proj <- paste0("\nprojected to dimensions ", x_lab, " and ", y_lab) # currently not used,
+        # but could be useful
+      }
+      else{
+        add_proj <- ""
+      }
+      
+      pl <- ggplot(dtaplot, aes(x = !!sym(name1), y = !!sym(name2), colour = group, label = label, shape = classified)) + 
+        geom_point() + 
+        xlim(min(dtaplot[[name1]])-1, max(dtaplot[[name1]]) * 1.1) + 
+        ylim(min(dtaplot[[name2]])-1, max(dtaplot[[name2]]) * 1.1) +  
+        ggtitle(paste0(title_gen, "")) + 
+        xlab(x_lab) + 
+        ylab(y_lab) + 
+        geom_text(nudge_x = 0.02, nudge_y = 0, show.legend = FALSE)+ 
+        labs(
+        colour = "Group",      
+        shape = "Classified") +
+        scale_colour_manual(
+        values = c("OC" = "firebrick4", "Healthy" = "green4")) +
+        theme_minimal() +  
+  theme(
+    plot.title = element_text(size = 11, hjust = 0.5)  # reduce title font size
+  )
+      
+      pl <- pl + geom_path(data = ell, aes(x = X1, y = X2), inherit.aes = FALSE, color = "black")
+      
+      ggsave(paste0("../plots/Ellipsoid/set", paste(catset, collapse = "_"), "/", name1, name2, ".pdf"),
+             plot = pl, width = 8, height = 6, create.dir = TRUE)
+      return(pl)
+    }
+  }
+}
+```
+
+**Example plots for each asssay: log(FAM)/log(HEX), log(FAM)+log(HEX) --> Figure for paper to be done later**
+
+```{r plot-grid, fig.width=14, fig.height=8, fig.align="center", warning=FALSE, message=FALSE}
+plot1_el <- createplots(dta %>% select(sum1_TIMM21_JAK, quot1_TIMM21_JAK) %>% names(), mu = 0.6)
+plot2_el <- createplots(dta %>% select(sum2_MYOCD_JAK, quot2_MYOCD_JAK) %>% names())
+plot3_el <- createplots(dta %>% select(sum3_CHR22_JAK, quot3_CHR22_JAK) %>% names())
+plot4_el <- createplots(dta %>% select(sum4_TIMM21_USP7, quot4_TIMM21_USP7) %>% names())
+plot5_el <- createplots(dta %>% select(sum5_PAK2_JAK, quot5_PAK2_JAK) %>% names())
+plot6_el <- createplots(dta %>% select(sum6_PVT1_JAK, quot6_PVT1_JAK) %>% names())
+plot_final <- plot_grid(
+  plot1_el, plot2_el, plot3_el,
+  plot4_el, plot5_el, plot6_el,
+  labels = c('A', 'B', 'C', 'D', 'E', 'F'),
+  ncol = 3,
+  align = 'hv'
+)
+
+plot_final
+```
+
+
+
+### Plots with goodness of fit for separating ellipses for all values of mu
+
+Calculates sensitivity and specificity for all values of mu for all assays
+
+```{r}
+# create_roc calculates goodness of fit values of mu between 0 and 1
+create_roc <- function(catnames, mus = NULL, n=1000){
+  rocs <- c()
+  mus_ret<-c()
+  if (is.null(mus)){
+    mus <- c(10^-10, 10^-9, 10^-8, 10^-7, 10^-6, 10^-5, 10^-4)
+    mus <- c(mus, 1-mus)
+    mus <- c(mus, seq(0.001, 0.999, length.out = 100))
+  }
+  for (mu in mus){
+    # find solution with this specific mu
+    sol <- solve_ellipse(dta %>% select(ID, group, catnames), mu = mu) 
+    tab <- table(dta$group, (as.matrix(sol$data) %*% as.matrix(sol$solution)) > 0)
+    if (dim(tab)[2] < 2){ # if all classified sick or all classified healthy, skip
+      next
+    }
+    tab <- cbind(tab[1,1], tab[2,2])/rowSums(tab) # calculate Sens and Spec  
+    rocs <- rbind(rocs, tab)
+    mus_ret <- c(mus_ret, mu)
+  }
+  
+  rocs <- cbind(mus_ret, rocs)
+  colnames(rocs) <- c("mus", "Sens", "Spec")
+  
+  rocs <- as.data.frame(rocs)
+  rocs <- rocs[order(rocs$Sens, rocs$Spec),]
+  rocs$valid <- rank(rocs$Sens) + rank(rocs$Spec)
+  while(1){
+    rocs1 <- rocs %>% filter(valid > min(rocs$valid) + 0.5/n) # find the good mus
+    if (length(rocs1$mus) > 0){
+      rocs <- rocs1
+    }
+    rocs$valid <- rank(rocs$Sens) + rank(rocs$Spec)
+    if (length(unique(rocs$valid)) ==1){
+      break
+    }
+  }
+  rocs <- rocs[order(rocs$Sens, rocs$Spec, abs(0.5-rocs$mus)),]
+  rocs <- rocs %>% filter(!duplicated(paste0(rocs$Sens, "_", rocs$Spec)))
+  rocs <- rocs[order(rocs$mus),]
+  rocs <- rbind(c(0, 0, 1, mean(rocs$valid) - 1), rocs, c(1, 1, 0, mean(rocs$valid) + 1))
+  
+  rocs <- rocs %>% mutate( # create good format for values of mu for plotting
+    mus = ifelse(
+      mus > 0 & mus < 0.01, paste0(formatC(mus, format = "e", digits = 0)),
+                 ifelse(mus > 0.99 & mus < 1, paste0("1-", formatC(1-mus, format = "e", digits = 0)),
+                                                      paste0(as.character(round(mus, 3))))),
+    mus = ifelse(nchar(mus) < 2, paste0("   ", mus), mus)
+  )
+  return (rocs)
+}
+
+# Function that calculates AUC for different mu
+calculate_auc <- function(rocs){
+  trapezoids = (diff(rocs$Spec)/2 + rocs$Spec[-c(length(rocs$Spec))]) * diff(rocs$Sens)
+  return (sum(trapezoids))
+}
+```
+**Plots**
+
+```{r}
+rocs <-  create_roc(dta %>% select(sum1_TIMM21_JAK, quot1_TIMM21_JAK) %>% names())
+auc <- round(calculate_auc(rocs), 3)
+p1<-ggplot(rocs, aes(x = Spec, y = Sens, label = mus)) +
+  geom_point() +
+  geom_path() +
+  scale_x_reverse(limits = c(1,0)) +
+  ylim(0,1) + 
+  ggtitle(paste0("TIMM21 and JAK, AUC ", auc)) + 
+  geom_text(aes(x = pmax(Spec - nchar(mus)*0.015, 0), y = pmax(Sens-0.03, 0)), size = 2) +
+  theme_minimal() +
+  theme(title = element_text(size = 7))
+
+rocs <-  create_roc(dta %>% select(sum2_MYOCD_JAK, quot2_MYOCD_JAK) %>% names())
+auc <- round(calculate_auc(rocs), 3)
+p2<-ggplot(rocs, aes(x = Spec, y = Sens, label = mus)) +
+  geom_point() +
+  geom_path() +
+  scale_x_reverse(limits = c(1,0)) +
+  ylim(0,1) + 
+  ggtitle(paste0("MYOCD and JAK, AUC ", auc)) + 
+  geom_text(aes(x = pmax(Spec - nchar(mus)*0.015, 0), y = pmax(Sens-0.03, 0)), size = 2) + 
+  theme_minimal() +
+  theme(title = element_text(size = 7))
+
+rocs <-  create_roc(dta %>% select(sum3_CHR22_JAK, quot3_CHR22_JAK) %>% names())
+auc <- round(calculate_auc(rocs), 3)
+p3<-ggplot(rocs, aes(x = Spec, y = Sens, label = mus)) +
+  geom_point() +
+  geom_path() +
+  scale_x_reverse(limits = c(1,0)) +
+  ylim(0,1) + 
+  ggtitle(paste0("CHR22 and JAK, AUC ", auc)) + 
+  geom_text(aes(x = pmax(Spec - nchar(mus)*0.015, 0), y = pmax(Sens-0.03, 0)), size = 2) + 
+  theme_minimal() +
+  theme(title = element_text(size = 7)) 
+
+rocs <-  create_roc(dta %>% select(sum4_TIMM21_USP7, quot4_TIMM21_USP7) %>% names())
+auc <- round(calculate_auc(rocs), 3)
+p4<-ggplot(rocs, aes(x = Spec, y = Sens, label = mus)) +
+  geom_point() +
+  geom_path() +
+  scale_x_reverse(limits = c(1,0)) +
+  ylim(0,1) + 
+  ggtitle(paste0("TIMM21 and USP7, AUC ", auc)) + 
+  geom_text(aes(x = pmax(Spec - nchar(mus)*0.015, 0), y = pmax(Sens-0.03, 0)), size = 2) + 
+  theme_minimal() +
+  theme(title = element_text(size = 7))
+
+rocs <-  create_roc(dta %>% select(sum5_PAK2_JAK, quot5_PAK2_JAK) %>% names())
+auc <- round(calculate_auc(rocs), 3)
+p5<-ggplot(rocs, aes(x = Spec, y = Sens, label = mus)) +
+  geom_point() +
+  geom_path() +
+  scale_x_reverse(limits = c(1,0)) +
+  ylim(0,1) + 
+  ggtitle(paste0("PAK2 and JAK, AUC ", auc)) + 
+  geom_text(aes(x = pmax(Spec - nchar(mus)*0.015, 0), y = pmax(Sens-0.03, 0)), size = 2) + 
+  theme_minimal() +
+  theme(title = element_text(size = 7))
+
+rocs <-  create_roc(dta %>% select(sum6_PVT1_JAK, quot6_PVT1_JAK) %>% names())
+auc <- round(calculate_auc(rocs), 3)
+p6<-ggplot(rocs, aes(x = Spec, y = Sens, label = mus)) +
+  geom_point() +
+  geom_path() +
+  scale_x_reverse(limits = c(1,0)) +
+  ylim(0,1) + 
+  ggtitle(paste0("PVT1 and JAK, AUC ", auc)) + 
+  geom_text(aes(x = pmax(Spec - nchar(mus)*0.015, 0), y = pmax(Sens-0.03, 0)), size = 2) + 
+  theme_minimal() +
+  theme(title = element_text(size = 7))
+
+jpeg("../plots/final/Goodness_of_fit.jpg",height=6,width=8,units='in',res=600)
+pl <- grid.arrange(p1, p2, p3, p4, p5, p6, 
+                              nrow = 2, 
+                   top = text_grob("Goodness of classifications for different values of mu"))
+dev.off()
+#ggsave("../plots/Ellipsoid/Goodness.pdf", plot = pl, width = 8, height = 6, device = cairo_ps)
+```
+
+**Selected plots based on optimal mu values from the ROC plot   **
+
+```{r, warning=FALSE, message=FALSE}
+jpeg("../plots/final/PAK2_JAK.jpg",height=6,width=8,units='in',res=600)
+createplots(dta %>% select(sum5_PAK2_JAK, quot5_PAK2_JAK) %>% names(), mu =0.888)
+dev.off()
+jpeg("../plots/final/PVT1_JAK.jpg",height=6,width=8,units='in',res=600)
+createplots(dta %>% select(sum6_PVT1_JAK, quot6_PVT1_JAK) %>% names(), mu = 0.868)
+dev.off()
+
+createplots(dta %>% select(sum5_PAK2_JAK, quot5_PAK2_JAK) %>% names(), mu =0.888)
+createplots(dta %>% select(sum6_PVT1_JAK, quot6_PVT1_JAK) %>% names(), mu = 0.868)
+```   
+
+This section is needed for the additional plots of follow-up timepoints.
+
+```{r}
+# Save 2D ellipse solutions for each assay pair 
+# These use the SAME mu values as the plots above.
+
+# 6-panel grid solutions (mu as used in createplots calls)
+sol_2d_1 <- solve_ellipse(dta %>% select(ID, group, sum1_TIMM21_JAK, quot1_TIMM21_JAK), mu = 0.6)
+sol_2d_2 <- solve_ellipse(dta %>% select(ID, group, sum2_MYOCD_JAK, quot2_MYOCD_JAK), mu = 0.5)
+sol_2d_3 <- solve_ellipse(dta %>% select(ID, group, sum3_CHR22_JAK, quot3_CHR22_JAK), mu = 0.5)
+sol_2d_4 <- solve_ellipse(dta %>% select(ID, group, sum4_TIMM21_USP7, quot4_TIMM21_USP7), mu = 0.5)
+sol_2d_5 <- solve_ellipse(dta %>% select(ID, group, sum5_PAK2_JAK, quot5_PAK2_JAK), mu = 0.5)
+sol_2d_6 <- solve_ellipse(dta %>% select(ID, group, sum6_PVT1_JAK, quot6_PVT1_JAK), mu = 0.5)
+
+# "Optimal mu" solutions for ALL 6 assays (from ROC analysis)
+sol_2d_1_opt <- solve_ellipse(dta %>% select(ID, group, sum1_TIMM21_JAK, quot1_TIMM21_JAK), mu = 0.807)
+sol_2d_2_opt <- solve_ellipse(dta %>% select(ID, group, sum2_MYOCD_JAK, quot2_MYOCD_JAK), mu = 0.787)
+sol_2d_3_opt <- solve_ellipse(dta %>% select(ID, group, sum3_CHR22_JAK, quot3_CHR22_JAK), mu = 0.787)
+sol_2d_4_opt <- solve_ellipse(dta %>% select(ID, group, sum4_TIMM21_USP7, quot4_TIMM21_USP7), mu = 0.908)
+sol_2d_5_opt <- solve_ellipse(dta %>% select(ID, group, sum5_PAK2_JAK, quot5_PAK2_JAK), mu = 0.888)
+sol_2d_6_opt <- solve_ellipse(dta %>% select(ID, group, sum6_PVT1_JAK, quot6_PVT1_JAK), mu = 0.868)
+
+# Bundle everything into one list and save
+sol_2d_all <- list(
+  # grid solutions (default/specified mu)
+  grid = list(
+    `1` = sol_2d_1, `2` = sol_2d_2, `3` = sol_2d_3,
+    `4` = sol_2d_4, `5` = sol_2d_5, `6` = sol_2d_6
+  ),
+  # optimal-mu solutions for all 6 assays
+  optimal = list(
+    `1` = sol_2d_1_opt, `2` = sol_2d_2_opt, `3` = sol_2d_3_opt,
+    `4` = sol_2d_4_opt, `5` = sol_2d_5_opt, `6` = sol_2d_6_opt
+  ),
+  # record which mu was used (for reference)
+  mu_grid    = c(0.6, 0.5, 0.5, 0.5, 0.5, 0.5),
+  mu_optimal = c(0.807, 0.787, 0.787, 0.908, 0.888, 0.868),
+  # record the baseline data used
+  baseline_data = dta
+)
+
+saveRDS(sol_2d_all, "../results/ellipsoid_2d_assay_solutions.rds")
+cat("Saved 2D per-assay ellipse solutions to ../results/ellipsoid_2d_assay_solutions.rds\n")
+
+```
+
+### The perfect combinations (which combination of assays are the best in classifying?)
+
+```{r}
+combs <- c() # perfect combinations
+for (myco in mycomb(1:6, 4)){
+  sol <- solve_ellipse(dta %>% select(ID, group, starts_with(paste("sum", unlist(myco), sep="")),
+                                      starts_with(paste("quot", unlist(myco), sep=""))
+  ))
+  tab <- table(dta$group, (as.matrix(sol$data) %*% as.matrix(sol$solution)) > 0)
+  if (tab[1,2] == 0 & tab[2,1] == 0){
+    combs <- rbind(combs, unlist(myco))
+  }
+}
+combs 
+```
+
+
+```{r, echo=FALSE}
+# Define assay names for index 1–6
+assay_labels <- c("TIMM21 and JAK", "MYOCD and JAK", "CHR22 and JAK", 
+                  "TIMM21 and USP7", "PAK2 and JAK", "PVT1 and JAK")
+
+# Your matrix of combinations (rows = combinations, cols = assay indices)
+combs <- matrix(c(
+  1, 2, 3, 4,
+  1, 2, 3, 5,
+  1, 2, 3, 6,
+  1, 2, 4, 5,
+  1, 2, 5, 6,
+  2, 3, 4, 5,
+  2, 3, 4, 6
+), ncol = 4, byrow = TRUE)
+
+# Convert to long format
+combo_df <- as.data.frame(combs)
+combo_df$ComboID <- paste0("Combination ", seq_len(nrow(combs)))
+
+long_df <- pivot_longer(combo_df, cols = starts_with("V"), values_to = "AssayIndex") %>%
+  mutate(Assay = factor(assay_labels[AssayIndex], levels = assay_labels),
+         ComboID = factor(ComboID, levels = rev(paste0("Combination ", seq_len(nrow(combs))))))
+
+# Plot with assays as X and combinations as Y
+ggplot(long_df, aes(x = Assay, y = ComboID, fill = Assay)) +
+  geom_tile(color = "white") +
+  labs(
+    title = "",
+    x = "Assay",
+    y = "Combinations"
+  ) +
+  scale_x_discrete(position = "top") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 30, hjust = 0),
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5)
+  )
+
+ggsave("../plots/final/perfect_assay_combinations.jpg", width = 8, height = 5, dpi = 300)
+
+```
+
+
+So, these combinations (e.g. 1,2,3,4 or 1,2,3,5 etc) are perfect combinations: that is they can classify perfectly within this dataset.
+
+- Category 1: TIMM21 and JAK, MYOCD and JAK, CHR22 and JAK, TIMM21 and USP7, PAK2 and JAK
+
+**Use all 6 assays and get the BEST classifier (constisting of A and x0)**
+
+```{r}
+sol <- solve_ellipse(dta %>% select(ID, group, 
+                                    sum1_TIMM21_JAK, quot1_TIMM21_JAK,
+                                    sum2_MYOCD_JAK, quot2_MYOCD_JAK,
+                                    sum3_CHR22_JAK, quot3_CHR22_JAK,
+                                    sum4_TIMM21_USP7, quot4_TIMM21_USP7,
+                                    sum5_PAK2_JAK, quot5_PAK2_JAK,
+                                    sum6_PVT1_JAK, quot6_PVT1_JAK), perfect = TRUE)
+
+saveRDS(sol, "../results/ellipsoid_classifier_all6assays.rds")
+```
+We provide a classifier using all 6 assays which is closest to controls (in the supplementary table)
+
+```{r}
+sol$A
+sol$x0
+```
+
+
+```{r, echo=FALSE}
+# Combine A matrix and x0 vector into one table
+classifier_df <- as.data.frame(sol$A)
+classifier_df$x0 <- sol$x0  # Add x0 as last column
+rownames(classifier_df) <- colnames(sol$A)  # Optional: label rows clearly
+
+# Export to CSV
+write.csv(classifier_df, "../results/ellipsoid_classifier_all6assays.csv", row.names = TRUE)
+
+```
+
