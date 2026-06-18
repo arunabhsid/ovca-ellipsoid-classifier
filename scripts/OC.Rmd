@@ -32,7 +32,7 @@ library(cowplot)
 Python functions:
 
 ```{r python_functions, message=FALSE, warning=FALSE}
-use_python("/usr/bin/python3")
+use_python("/usr/bin/python3") # set this to your own python 3 path
 source_python("OC_ellipsoid.py")
 source_python("OC_linear_prog.py")
 # use matrix command from R, not from python
