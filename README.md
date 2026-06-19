@@ -38,6 +38,6 @@ Python 3, with numpy, pandas, scipy, and cvxopt. The semidefinite program is sol
 
 Add the R and Python version numbers and the package versions.
 
-## Status
+## Notes
 
-Manuscript submitted.
+Manuscript submitted. Code contributors: Michael Kalab, Arunabh Sharma
